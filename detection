@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""
+detector.py - phát hiện nghi ngờ đuối nước trên Raspberry Pi 4 (2 GB), chạy không cần màn hình.
+
+Luồng dữ liệu:
+  Camera thread --(frame mới nhất)--> Main: YOLO > tracker > điểm rủi ro > báo động --(job)--> Notify thread
+  - Camera thread: chụp liên tục, nén JPEG vào bộ đệm vòng làm bằng chứng, chỉ giữ 1 frame mới nhất cho YOLO.
+  - Main: phát hiện, bám người, tính điểm rủi ro (risk score) và máy trạng thái cho từng người.
+  - Notify thread: ghép clip H.264 bằng ffmpeg, gửi Telegram có thử lại, xóa file đã gửi, dọn thư mục alerts.
+
+Biến môi trường (supervisor.py đã truyền sẵn): ROI_FILE, BOT_TOKEN, ALLOWED_CHAT_IDS.
+Tùy chọn: MODEL_DIR (mặc định drowning_ncnn_model), SHOW=1 (mở cửa sổ xem khi chỉnh thử, cần màn hình).
+"""
+import json
+import os
+import queue
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+import requests
+
+BASE = Path(__file__).resolve().parent
+ALERT_DIR = BASE / "alerts"
+MODEL_DIR = os.environ.get("MODEL_DIR", str(BASE / "drowning_ncnn_model"))
+ROI_FILE = os.environ.get("ROI_FILE", str(BASE / "roi.json"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_IDS = [int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip()]
+SHOW = os.environ.get("SHOW") == "1"
+
+# ======================= THAM SỐ (chỉnh theo video thật của hồ bơi) =======================
+# Camera / model
+FRAME_W, FRAME_H, CAM_FPS = 640, 480, 10
+IMGSZ = 320
+CLASSES = [0]
+CONF_LOW = 0.25        # detection yếu: chỉ dùng để bám tiếp người đã có
+CONF_NEW = 0.45        # chỉ detection chắc chắn mới được tạo người mới
+MIN_BOX_H = 18         # bỏ hộp quá nhỏ (nhiễu, bọt nước)
+CAM_STALL_S = 3.0      # camera đứng hình lâu hơn mức này: xóa trạng thái, không tính là "mất dấu"
+
+# Tracker
+MAX_AGE_S = 1.5        # trong ngần này giây vẫn khớp bình thường theo vị trí dự đoán
+REVIVE_S = 6.0         # trong ngần này giây, người xuất hiện lại gần chỗ cũ được nhận lại ID cũ
+GATE = 1.0             # khoảng cách khớp tối đa, tính theo chiều cao hộp (không dùng pixel cố định)
+REVIVE_GATE = 1.5      # bán kính nhận lại ngay sau khi mất dấu (theo chiều cao hộp)
+REVIVE_SPEED = 0.6     # mỗi giây mất dấu cho phép nổi lên xa thêm ngần này (người lặn bơi tiếp rồi nổi lên)
+REVIVE_MAX = 4.0
+MIN_HITS = 3           # phải thấy ít nhất 3 lần mới tính là người thật
+TRACK_TTL_S = 35.0
+WIN_S = 3.0            # cửa sổ tính đặc trưng chuyển động
+
+# Điểm rủi ro (0-100)
+LOST_GRACE_S = 2.0     # mất dấu ngắn hơn mức này: coi như lặn/che khuất tạm, chưa tính điểm
+LOST_RATE = 12.0       # điểm mỗi giây khi mất dấu trong vùng nước (không có dấu hiệu gì thêm: ~8 giây thì báo)
+ALERT_RISK = 70.0
+DECAY = 15.0           # điểm giảm mỗi giây khi thấy lại bình thường
+STILL_CAP = 35.0       # đứng yên lâu trong nước chỉ nâng nền tối đa ngần này, không tự gây báo động
+FLOOR_CAP = 45.0
+ACC_LO, ACC_RANGE = 0.08, 0.20   # ngưỡng dao động (gia tốc tâm hộp / chiều cao hộp)
+STILL_PATH = 0.30      # đi được ít hơn 0.3 chiều cao hộp trong cửa sổ = đứng yên
+BORDER_FRAC = 0.06     # mất dấu sát mép khung hình: nhiều khả năng bơi ra ngoài tầm nhìn
+DUP_S = 90.0           # báo động gần chỗ đã báo trong ngần này giây: coi là cùng một sự kiện
+
+# Bằng chứng gửi Telegram
+BUFFER_S = 45
+JPEG_Q = 75
+PRE_S, POST_S = 6.0, 8.0
+CLIP_FPS, CLIP_W, CRF = 5, 480, 30
+KEEP_FILES, MAX_MB = 40, 300
+# ==========================================================================================
+
+
+def log(*a):
+    msg = " ".join(str(x) for x in a)
+    if BOT_TOKEN:
+        msg = msg.replace(BOT_TOKEN, "***")   # lỗi của requests hay kèm URL có token
+    print(time.strftime("%F %T"), msg, flush=True)
+
+
+# ------------------------------- Hình học -------------------------------
+def box_iou(a, b):
+    iw = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    ih = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = iw * ih
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def zone_dist(zone, x, y):
+    """Khoảng cách có dấu tới mép vùng nước: dương = trong vùng."""
+    return cv2.pointPolygonTest(zone, (float(x), float(y)), True)
+
+
+def near_border(b):
+    m = BORDER_FRAC
+    return bool(b[0] < m * FRAME_W or b[2] > (1 - m) * FRAME_W or b[1] < m * FRAME_H or b[3] > (1 - m) * FRAME_H)
+
+
+# ------------------------------- Tracker -------------------------------
+class Track:
+    def __init__(self, tid, d, t):
+        self.id = tid
+        self.box = np.array(d[:4], np.float32)
+        self.vel = np.zeros(2, np.float32)
+        self.last_seen = t
+        self.hits = 1
+        self.hist = deque(maxlen=60)       # (t, cx, cy, h) của hộp THÔ, để đo dao động đúng
+        self._push(d, t)
+        self.risk = 0.0
+        self.state = "SAFE"
+        self.ctx = None
+        self.last_in_roi = -1e9
+        self.still_s = 0.0
+        self.alerted = False
+
+    @property
+    def confirmed(self):
+        return self.hits >= MIN_HITS
+
+    @property
+    def c(self):
+        return np.array([(self.box[0] + self.box[2]) / 2, (self.box[1] + self.box[3]) / 2], np.float32)
+
+    @property
+    def h(self):
+        return max(1.0, float(self.box[3] - self.box[1]))
+
+    def _push(self, d, t):
+        self.hist.append((t, (d[0] + d[2]) / 2, (d[1] + d[3]) / 2, max(1.0, d[3] - d[1])))
+
+    def predict(self, t):
+        return self.c + self.vel * min(t - self.last_seen, MAX_AGE_S)
+
+    def update(self, d, t):
+        dt = max(1e-3, t - self.last_seen)
+        gap = dt > MAX_AGE_S
+        old = self.c
+        a = 1.0 if gap else 0.6            # làm mượt hộp, trừ khi vừa nhận lại sau khoảng mất dấu dài
+        self.box = a * np.array(d[:4], np.float32) + (1 - a) * self.box
+        self.vel = np.zeros(2, np.float32) if gap else 0.5 * self.vel + 0.5 * (self.c - old) / dt
+        self.last_seen = t
+        self.hits += 1
+        self._push(d, t)
+
+
+class Tracker:
+    """IoU + khoảng cách chuẩn hóa theo cỡ người, có dự đoán vận tốc, khớp 1-1 toàn cục, 2 vòng kiểu ByteTrack."""
+
+    def __init__(self):
+        self.tracks, self.next_id = {}, 1
+
+    def reset(self):
+        self.tracks.clear()
+
+    def _assign(self, cand, dets, t, used, matched):
+        pairs = []
+        for k in cand:
+            if k.id in used:
+                continue
+            pc = k.predict(t)
+            c0 = k.c
+            pbox = k.box + np.array([pc[0] - c0[0], pc[1] - c0[1]] * 2, np.float32)
+            for j, d in enumerate(dets):
+                dist = float(np.hypot(pc[0] - (d[0] + d[2]) / 2, pc[1] - (d[1] + d[3]) / 2)) / max(k.h, d[3] - d[1])
+                if dist <= GATE:
+                    pairs.append((dist - box_iou(pbox, d), k.id, j))
+        pairs.sort()
+        taken = set()
+        for _, tid, j in pairs:             # mỗi track và mỗi detection chỉ được khớp một lần
+            if tid not in used and j not in taken:
+                used.add(tid)
+                taken.add(j)
+                matched[tid] = dets[j]
+        return [d for j, d in enumerate(dets) if j not in taken]
+
+    def _revive(self, d, t, used):
+        dc = np.array([(d[0] + d[2]) / 2, (d[1] + d[3]) / 2])
+        dh = d[3] - d[1]
+        best, best_dist = None, 1e9
+        for k in self.tracks.values():
+            age = t - k.last_seen
+            if k.id in used or not k.confirmed or not (MAX_AGE_S < age <= REVIVE_S):
+                continue
+            if not 0.6 <= dh / k.h <= 1.6:  # cỡ người phải tương tự
+                continue
+            gate = min(REVIVE_MAX, REVIVE_GATE + REVIVE_SPEED * (age - MAX_AGE_S))   # mất càng lâu càng được nổi lên xa
+            dist = float(np.hypot(*(k.c - dc))) / max(k.h, dh)
+            if dist < gate and dist < best_dist:
+                best, best_dist = k, dist
+        return best
+
+    def update(self, dets, t):
+        """dets: danh sách (x1, y1, x2, y2, conf)."""
+        cand = [k for k in self.tracks.values() if t - k.last_seen <= MAX_AGE_S]
+        high = [d for d in dets if d[4] >= CONF_NEW]
+        low = [d for d in dets if d[4] < CONF_NEW]
+        used, matched = set(), {}
+        fresh = self._assign(cand, high, t, used, matched)   # vòng 1: detection chắc chắn
+        self._assign(cand, low, t, used, matched)            # vòng 2: detection yếu, chỉ để bám tiếp
+        for tid, d in matched.items():
+            self.tracks[tid].update(d, t)
+        for d in fresh:                                      # còn dư (chắc chắn) = người mới hoặc người quay lại
+            if d[3] - d[1] < MIN_BOX_H:
+                continue
+            k = self._revive(d, t, used)
+            if k:
+                used.add(k.id)
+                k.update(d, t)
+            else:
+                self.tracks[self.next_id] = Track(self.next_id, d, t)
+                self.next_id += 1
+        for tid in [i for i, k in self.tracks.items()
+                    if t - k.last_seen > TRACK_TTL_S or (not k.confirmed and t - k.last_seen > 1.0)]:
+            del self.tracks[tid]
+
+
+# ------------------------------- Điểm rủi ro -------------------------------
+def features(k, now, zone):
+    """Đặc trưng chuyển động trong ~3 giây gần nhất, chuẩn hóa theo chiều cao hộp."""
+    f = {"struggle": 0.0, "still": False, "to_exit": False, "border": near_border(k.box)}
+    pts = [p for p in k.hist if now - p[0] <= WIN_S]
+    if len(pts) < 5 or pts[-1][0] - pts[0][0] < 1.5:
+        return f
+    a = np.array(pts, np.float64)            # cột: t, x, y, h
+    h = float(np.median(a[:, 3]))
+    acc = float(np.hypot(np.diff(a[:, 1], 2), np.diff(a[:, 2], 2)).mean()) / h   # dao động tần số cao
+    path = float(np.hypot(np.diff(a[:, 1]), np.diff(a[:, 2])).sum()) / h
+    net = float(np.hypot(a[-1, 1] - a[0, 1], a[-1, 2] - a[0, 2])) / h
+    if net < 1.0:                            # lắc nhiều mà không tiến đi đâu
+        f["struggle"] = float(np.clip((acc - ACC_LO) / ACC_RANGE, 0.0, 1.0))
+    f["still"] = path < STILL_PATH
+    d0, d1 = zone_dist(zone, a[0, 1], a[0, 2]), zone_dist(zone, a[-1, 1], a[-1, 2])
+    f["to_exit"] = bool(0 <= d1 < 1.5 * h and d1 < d0 and net > 0.08)             # đang tiến về mép vùng nước
+    return f
+
+
+def lost_multiplier(k):
+    c, m = k.ctx, 1.0
+    if c["struggle"] > 0.5:
+        m *= 1.5
+    if c["still"]:
+        m *= 1.3
+    if c["to_exit"]:
+        m *= 0.2
+    if c["border"]:
+        m *= 0.4
+    if k.hits < 8:                           # track còn non, độ tin cậy thấp
+        m *= 0.6
+    return m
+
+
+def step_risk(k, now, dt, zone):
+    lost = now - k.last_seen
+    if lost < 0.3:                           # đang thấy ở khung này
+        k.ctx = features(k, now, zone)
+        in_roi = zone_dist(zone, *k.c) >= 0
+        if in_roi:
+            k.last_in_roi = now
+        k.still_s = k.still_s + dt if in_roi and k.ctx["still"] else 0.0
+        floor = 0.0
+        if in_roi:
+            floor = min(FLOOR_CAP, min(STILL_CAP, 1.2 * k.still_s) + 30.0 * k.ctx["struggle"])
+        k.risk = max(floor, k.risk - DECAY * dt)
+    elif lost > LOST_GRACE_S:
+        if k.last_seen - k.last_in_roi < 1.0:    # biến mất ngay trong vùng nước
+            k.risk = min(100.0, k.risk + LOST_RATE * lost_multiplier(k) * dt)
+        else:
+            k.risk = max(0.0, k.risk - DECAY * dt)
+
+
+def state_of(k, now):
+    lost = now - k.last_seen
+    if k.alerted or k.risk >= ALERT_RISK:
+        return "CRITICAL_ALERT"
+    if lost > LOST_GRACE_S and k.risk >= 25:
+        return "SUBMERGED_SUSPICIOUS"
+    if lost < 0.3 and k.ctx and k.ctx["struggle"] > 0.5:
+        return "STRUGGLING"
+    if lost < 0.3 and now - k.last_in_roi < 1.0:
+        return "IN_WATER"
+    return "SAFE"
+
+
+def reasons(k, lost):
+    c = k.ctx or {}
+    r = [f"mất dấu {lost:.0f}s trong vùng nước"]
+    if c.get("struggle", 0) > 0.5:
+        r.append("vật lộn trước khi mất")
+    if c.get("still"):
+        r.append("đứng yên")
+    if c.get("border"):
+        r.append("gần mép khung hình")
+    return ", ".join(r)
+
+
+def is_duplicate(k, t, recent):
+    recent[:] = [a for a in recent if t - a[0] < DUP_S]
+    return any(np.hypot(k.c[0] - a[1], k.c[1] - a[2]) < 1.5 * max(k.h, a[3]) for a in recent)
+
+
+def analyse(tracker, dets, t, dt, zone, recent):
+    """Một bước xử lý: cập nhật tracker, tính rủi ro, trả về các track cần báo động."""
+    tracker.update(dets, t)
+    fired = []
+    for k in tracker.tracks.values():
+        if not k.confirmed:
+            continue
+        step_risk(k, t, dt, zone)
+        new_state = state_of(k, t)
+        if new_state != k.state:
+            log(f"ID {k.id}: {k.state} -> {new_state} (risk {k.risk:.0f})")
+            k.state = new_state
+        if k.risk >= ALERT_RISK and not k.alerted:
+            k.alerted = True
+            if is_duplicate(k, t, recent):
+                log(f"ID {k.id}: trùng sự kiện đã báo, bỏ qua")
+            else:
+                recent.append((t, float(k.c[0]), float(k.c[1]), k.h))
+                fired.append(k)
+    return fired
+
+
+# ------------------------------- Camera -------------------------------
+class Camera(threading.Thread):
+    def __init__(self, stop):
+        super().__init__(daemon=True)
+        self.stop_ev = stop
+        self.latest = queue.Queue(maxsize=1)
+        self.ring = deque()                  # (t, jpeg bytes) ~BUFFER_S giây, ~10 MB
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _open():
+        from picamera2 import Picamera2
+        cam = Picamera2()
+        cam.configure(cam.create_preview_configuration(
+            main={"size": (FRAME_W, FRAME_H), "format": "RGB888"},
+            controls={"FrameRate": CAM_FPS}))
+        cam.start()
+        return cam
+
+    @staticmethod
+    def _close(cam):
+        try:
+            cam.stop()
+            cam.close()
+        except Exception:
+            pass
+
+    def run(self):
+        cam = None
+        while not self.stop_ev.is_set():
+            try:
+                if cam is None:
+                    cam = self._open()
+                    log("camera sẵn sàng")
+                frame = cam.capture_array()
+                t = time.monotonic()
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_Q])
+                if ok:
+                    with self.lock:
+                        self.ring.append((t, buf.tobytes()))
+                        while self.ring and t - self.ring[0][0] > BUFFER_S:
+                            self.ring.popleft()
+                try:
+                    self.latest.get_nowait()  # bỏ frame cũ chưa kịp xử lý, luôn giữ frame mới nhất
+                except queue.Empty:
+                    pass
+                self.latest.put((t, frame))
+            except Exception as e:
+                log("camera lỗi:", e)
+                if cam is not None:
+                    self._close(cam)
+                    cam = None
+                self.stop_ev.wait(3)
+        if cam is not None:
+            self._close(cam)
+
+
+# ------------------------------- Gửi cảnh báo -------------------------------
+def cleanup():
+    """Giữ thư mục alerts gọn: tối đa KEEP_FILES file và MAX_MB megabyte, xóa file cũ nhất trước."""
+    files = sorted(ALERT_DIR.glob("alert_*"), key=os.path.getmtime)
+    total = sum(f.stat().st_size for f in files)
+    while files and (len(files) > KEEP_FILES or total > MAX_MB * 1e6):
+        f = files.pop(0)
+        try:
+            total -= f.stat().st_size
+            f.unlink()
+        except OSError:
+            pass
+
+
+class Notifier(threading.Thread):
+    def __init__(self, cam, stop):
+        super().__init__(daemon=True)
+        self.cam, self.stop_ev, self.q = cam, stop, queue.Queue()
+
+    def alert(self, job):
+        self.q.put(job)
+
+    def text(self, msg):
+        self.q.put({"text": msg})
+
+    def run(self):
+        while not (self.stop_ev.is_set() and self.q.empty()):
+            try:
+                job = self.q.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
+                self.handle(job)
+            except Exception as e:
+                log("gửi cảnh báo lỗi:", e)
+
+    def send(self, method, data, field=None, path=None):
+        if not (BOT_TOKEN and CHAT_IDS):
+            return False
+        ok_all = True
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+        for chat in CHAT_IDS:
+            for attempt in range(3):
+                try:
+                    payload = dict(data, chat_id=chat)
+                    if path:
+                        with open(path, "rb") as f:
+                            r = requests.post(url, data=payload, files={field: f}, timeout=90)
+                    else:
+                        r = requests.post(url, data=payload, timeout=30)
+                    if r.ok:
+                        break
+                    log(f"Telegram {method} lỗi {r.status_code}: {r.text[:120]}")
+                except Exception as e:
+                    log(f"Telegram {method} lỗi:", e)
+                time.sleep(5 * 3 ** attempt)
+            else:
+                ok_all = False
+        return ok_all
+
+    def handle(self, job):
+        if "text" in job:
+            self.send("sendMessage", {"text": job["text"]})
+            return
+        photo = ALERT_DIR / f"{job['stem']}.jpg"
+        cv2.imwrite(str(photo), job["snap"], [cv2.IMWRITE_JPEG_QUALITY, 70])
+        sent = self.send("sendPhoto", {"caption": job["caption"]}, "photo", photo)   # ảnh nhỏ nên tới trước
+        clip = self.make_clip(job)
+        if clip:
+            ok = self.send("sendVideo", {"caption": job["caption"], "supports_streaming": "true"}, "video", clip)
+            sent = sent and ok
+        if sent:                              # chỉ xóa khi đã gửi xong; lỗi mạng thì giữ lại để xem sau
+            for f in (photo, clip):
+                if f:
+                    f.unlink(missing_ok=True)
+        cleanup()
+
+    def make_clip(self, job):
+        with self.cam.lock:
+            frames = list(self.cam.ring)
+        t0, t1 = job["last_seen"] - PRE_S, job["last_seen"] + POST_S
+        sel, last = [], -1e9
+        for t, b in frames:                   # lấy CLIP_FPS khung/giây từ bộ đệm 10 khung/giây
+            if t0 <= t <= t1 and t - last >= 1.0 / CLIP_FPS - 0.02:
+                sel.append(b)
+                last = t
+        if len(sel) < 2:
+            return None
+        out = ALERT_DIR / f"{job['stem']}.mp4"
+        if shutil.which("ffmpeg"):
+            # `nice -n 19`: ffmpeg nhường CPU cho YOLO. Đẩy thẳng JPEG vào ffmpeg, Python không phải giải mã/mã hóa lại.
+            cmd = ["nice", "-n", "19", "ffmpeg", "-v", "error", "-y",
+                   "-f", "image2pipe", "-framerate", str(CLIP_FPS), "-c:v", "mjpeg", "-i", "-",
+                   "-vf", f"scale={CLIP_W}:-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(CRF),
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", str(out)]
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            try:
+                for b in sel:
+                    p.stdin.write(b)
+                p.stdin.close()
+                p.wait(timeout=120)
+            except Exception as e:
+                log("ffmpeg lỗi:", e)
+                p.kill()
+                return None
+            return out if p.returncode == 0 and out.exists() else None
+        log("không có ffmpeg, dùng OpenCV (file sẽ lớn hơn). Cài: sudo apt install ffmpeg")
+        first = cv2.imdecode(np.frombuffer(sel[0], np.uint8), cv2.IMREAD_COLOR)
+        size = (CLIP_W, int(first.shape[0] * CLIP_W / first.shape[1]) // 2 * 2)
+        vw = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*"mp4v"), CLIP_FPS, size)
+        for b in sel:
+            vw.write(cv2.resize(cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR), size))
+        vw.release()
+        return out
+
+
+def make_job(k, frame, zone, t):
+    snap = frame.copy()
+    x, y = int(k.c[0]), int(k.c[1])
+    cv2.polylines(snap, [zone], True, (0, 255, 255), 2)
+    cv2.circle(snap, (x, y), 12, (0, 0, 255), -1)
+    cv2.putText(snap, "LAST SEEN", (x + 14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    return {"snap": snap, "last_seen": k.last_seen,
+            "stem": f"alert_{time.strftime('%Y%m%d_%H%M%S')}_id{k.id}",
+            "caption": f"NGHI NGỜ ĐUỐI NƯỚC - ID {k.id}\nRủi ro {k.risk:.0f}/100: {reasons(k, t - k.last_seen)}"}
+
+
+# ------------------------------- Chính -------------------------------
+def load_zone():
+    roi = json.loads(Path(ROI_FILE).read_text())
+    return (np.array(roi["polygon_norm"], np.float32) * [FRAME_W, FRAME_H]).astype(np.int32)
+
+
+def detect(model, frame):
+    boxes = model(frame, imgsz=IMGSZ, classes=CLASSES, conf=CONF_LOW, iou=0.5, verbose=False)[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return []
+    return [(float(b[0]), float(b[1]), float(b[2]), float(b[3]), float(c))
+            for b, c in zip(boxes.xyxy.cpu().numpy(), boxes.conf.cpu().numpy())]
+
+
+def cpu_temp():
+    try:
+        return f"{int(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000:.0f}°C"
+    except Exception:
+        return "?°C"
+
+
+def main():
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    ALERT_DIR.mkdir(exist_ok=True)
+    cleanup()
+    if not (BOT_TOKEN and CHAT_IDS):
+        log("CẢNH BÁO: thiếu BOT_TOKEN hoặc ALLOWED_CHAT_IDS, sẽ không gửi được cảnh báo")
+    try:
+        zone = load_zone()
+    except Exception as e:
+        log("không đọc được ROI:", e)
+        return 2
+
+    from ultralytics import YOLO
+    model = YOLO(MODEL_DIR, task="detect")
+    model(np.zeros((FRAME_H, FRAME_W, 3), np.uint8), imgsz=IMGSZ, verbose=False)   # chạy thử cho nóng máy
+
+    cam = Camera(stop)
+    cam.start()
+    notifier = Notifier(cam, stop)
+    notifier.start()
+    tracker, recent = Tracker(), []
+    last_t, stalled, n, t_log = None, False, 0, time.monotonic()
+    log("detector sẵn sàng")
+
+    while not stop.is_set():
+        try:
+            t, frame = cam.latest.get(timeout=1.0)
+        except queue.Empty:
+            if last_t is not None and not stalled and time.monotonic() - last_t > CAM_STALL_S:
+                stalled = True
+                notifier.text("Camera mất tín hiệu, đang thử kết nối lại.")
+            continue
+        if stalled or (last_t is not None and t - last_t > CAM_STALL_S):
+            tracker.reset()                   # đứng hình xong thì bỏ hết, tránh báo động giả vì "mất dấu"
+            if stalled:
+                notifier.text("Camera đã hoạt động lại.")
+            stalled = False
+            last_t = None
+        dt = 0.0 if last_t is None else t - last_t
+        last_t = t
+
+        for k in analyse(tracker, detect(model, frame), t, dt, zone, recent):
+            log(f"BÁO ĐỘNG ID {k.id}, risk {k.risk:.0f}")
+            notifier.alert(make_job(k, frame, zone, t))
+
+        n += 1
+        if t - t_log >= 30:
+            log(f"FPS {n / (t - t_log):.1f} | {cpu_temp()} | {len(tracker.tracks)} track")
+            n, t_log = 0, t
+        if SHOW:
+            vis = frame.copy()
+            cv2.polylines(vis, [zone], True, (0, 255, 255), 2)
+            for k in tracker.tracks.values():
+                if k.confirmed and t - k.last_seen < 0.3:
+                    x1, y1, x2, y2 = map(int, k.box)
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(vis, f"ID{k.id} {k.risk:.0f}", (x1, max(12, y1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.imshow("detector", vis)
+            if cv2.waitKey(1) == 27:
+                stop.set()
+
+    stop.set()
+    cam.join(5)
+    notifier.join(3)
+    if SHOW:
+        cv2.destroyAllWindows()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
