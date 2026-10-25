@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""
+Supervisor cho Raspberry Pi: điều khiển bằng Telegram, chọn ROI bằng web.
+
+Lệnh trong Telegram:
+  run      chưa có ROI: gửi link web để vẽ vùng, lưu roi.json rồi chạy code của bạn
+           đã có ROI: chạy luôn
+  stop     dừng hẳn code của bạn và xóa roi.json
+  restart  dừng, xóa roi.json, gửi link web mới để chọn lại vùng
+
+Mất điện rồi bật lại: nếu roi.json còn trong bộ nhớ Pi thì tự chạy tiếp,
+nếu không có thì chờ lệnh run. Tắt máy hay khởi động lại bình thường KHÔNG xóa roi.json,
+chỉ có stop và restart mới xóa.
+
+Cài đặt:
+  pip install flask requests   (opencv, picamera2, ultralytics bạn đã cài sẵn cho detector.py)
+  Đặt supervisor.py, index.html, detector.py và thư mục drowning_ncnn_model cùng một thư mục.
+  supervisor.py phải chạy bằng đúng Python/venv đang chạy được detector.py
+  (picamera2 cài bằng apt nên venv cần tạo với --system-site-packages).
+  Cài thêm ffmpeg để nén clip cảnh báo: sudo apt install ffmpeg
+
+  File .env (cùng thư mục):
+    BOT_TOKEN=token_từ_BotFather
+    ALLOWED_CHAT_IDS=123456789          # nhắn bot một tin, bot sẽ trả lại chat ID của bạn
+    PUBLIC_URL=http://192.168.1.50:8080 # tùy chọn: địa chỉ để mở web (Tailscale, Cloudflare Tunnel...)
+    CAMERA=picam                        # tùy chọn: picam (camera Pi, mặc định), 0 (USB) hoặc URL RTSP
+    DETECTOR_CMD=python3 detector.py    # tùy chọn: lệnh chạy code của bạn
+
+  Tự chạy khi bật nguồn: /etc/systemd/system/roi.service
+    [Unit]
+    Description=ROI supervisor
+    After=network-online.target
+    Wants=network-online.target
+    [Service]
+    User=pi
+    WorkingDirectory=/home/pi/drowning
+    EnvironmentFile=/home/pi/drowning/.env
+    ExecStart=/usr/bin/python3 /home/pi/drowning/supervisor.py
+    Restart=always
+    [Install]
+    WantedBy=multi-user.target
+  Rồi: sudo systemctl enable --now roi
+
+Đọc ROI trong detector.py (biến môi trường ROI_FILE trỏ tới roi.json):
+    import json, os, numpy as np, cv2
+    roi = json.load(open(os.environ["ROI_FILE"]))
+    poly = np.array(roi["polygon"], np.int32)  # pixel theo roi["width"] x roi["height"]
+    # frame khác kích thước: poly = (np.array(roi["polygon_norm"]) * [w, h]).astype(np.int32)
+    in_zone = cv2.pointPolygonTest(poly, (cx, cy), False) >= 0
+"""
+import json
+import os
+import secrets
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import requests
+from flask import Flask, Response, jsonify, request, send_file
+
+BASE = Path(__file__).resolve().parent
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or sys.exit("Thiếu BOT_TOKEN")
+ALLOWED = {int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
+PORT = int(os.environ.get("PORT", "8080"))
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+CAMERA = os.environ.get("CAMERA", "picam")
+ROI_FILE = Path(os.environ.get("ROI_FILE", BASE / "roi.json"))
+DETECTOR_CMD = shlex.split(os.environ.get("DETECTOR_CMD") or f"{sys.executable} detector.py")
+TOKEN_TTL = 15 * 60
+HELP = "Lệnh: run (chọn vùng và chạy), stop (dừng hẳn, xóa vùng), restart (chọn lại vùng)."
+
+lock = threading.RLock()
+cam_lock = threading.Lock()
+proc = None
+session = {"token": None, "expires": 0.0}
+frame_size = None
+app = Flask(__name__)
+
+
+def log(*a):
+    msg = " ".join(str(x) for x in a).replace(BOT_TOKEN, "***")  # lỗi của requests hay kèm URL có token
+    print(datetime.now().strftime("%F %T"), msg, flush=True)
+
+
+# ---------- Telegram ----------
+def tg(method, **params):
+    params = {k: v for k, v in params.items() if v is not None}
+    r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params, timeout=40)
+    return r.json()
+
+
+def say(chat, text):
+    try:
+        tg("sendMessage", chat_id=chat, text=text)
+    except Exception as e:
+        log("gửi Telegram lỗi:", e)
+
+
+def broadcast(text):
+    """Gửi cho mọi chat được phép, thử lại nếu mạng chưa lên (Pi vừa bật nguồn)."""
+    def job():
+        for _ in range(12):
+            try:
+                for c in ALLOWED:
+                    tg("sendMessage", chat_id=c, text=text)
+                return
+            except Exception:
+                time.sleep(5)
+    threading.Thread(target=job, daemon=True).start()
+
+
+# ---------- Code của bạn (detector) ----------
+def running():
+    return proc is not None and proc.poll() is None
+
+
+def start_detector():
+    global proc
+    with lock:
+        if running():
+            return
+        env = dict(os.environ, ROI_FILE=str(ROI_FILE))
+        proc = subprocess.Popen(DETECTOR_CMD, cwd=BASE, env=env, start_new_session=True)
+        log("detector chạy, pid", proc.pid)
+
+
+def kill_detector():
+    global proc
+    with lock:
+        if running():
+            for sig, wait in ((signal.SIGTERM, 8), (signal.SIGKILL, 3)):
+                try:
+                    os.killpg(proc.pid, sig)
+                    proc.wait(wait)
+                    break
+                except ProcessLookupError:
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        proc = None
+
+
+def reset():
+    """Dừng hẳn: tắt detector, xóa roi.json, hủy link đang mở."""
+    with lock:
+        kill_detector()
+        ROI_FILE.unlink(missing_ok=True)
+        session.update(token=None, expires=0.0)
+
+
+def watchdog():
+    """Còn roi.json mà detector chết (lỗi, hết RAM...) thì chạy lại, giãn dần nếu chết liên tục."""
+    delay = 3
+    while True:
+        time.sleep(delay)
+        with lock:
+            if ROI_FILE.exists() and not running():
+                log("detector đã dừng, chạy lại")
+                start_detector()
+                delay = min(delay * 2, 60)
+            else:
+                delay = 3
+
+
+def resume_on_boot():
+    if not ROI_FILE.exists():
+        return
+    try:
+        json.loads(ROI_FILE.read_text())
+    except (OSError, ValueError):
+        ROI_FILE.unlink(missing_ok=True)
+        log("roi.json hỏng, đã xóa, chờ lệnh run")
+        return
+    start_detector()
+    broadcast("Pi vừa khởi động lại, đã chạy tiếp với vùng ROI đã lưu.")
+
+
+# ---------- Link web ----------
+def new_session():
+    with lock:
+        session["token"] = secrets.token_urlsafe(9)
+        session["expires"] = time.time() + TOKEN_TTL
+        return session["token"]
+
+
+def valid(t):
+    with lock:
+        tok = session["token"]
+        return bool(tok and t and secrets.compare_digest(t, tok) and time.time() < session["expires"])
+
+
+def base_url():
+    if PUBLIC_URL:
+        return PUBLIC_URL
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+    except OSError:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return f"http://{ip}:{PORT}"
+
+
+def link():
+    return f"{base_url()}/?t={new_session()}"
+
+
+# ---------- Camera ----------
+def read_frame():
+    if CAMERA == "picam":  # camera CSI của Pi (libcamera), cùng cấu hình với detector.py
+        from picamera2 import Picamera2
+        cam = Picamera2()
+        try:
+            cam.configure(cam.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"}))
+            cam.start()
+            time.sleep(1.0)  # cho tự động phơi sáng ổn định
+            return cam.capture_array()
+        finally:
+            try:
+                cam.stop()
+            except Exception:
+                pass
+            cam.close()
+    cap = cv2.VideoCapture(int(CAMERA) if CAMERA.isdigit() else CAMERA)
+    try:
+        if not cap.isOpened():
+            raise RuntimeError("Không mở được camera")
+        frame = None
+        for _ in range(8):  # bỏ vài khung đầu để camera cân sáng
+            ok, f = cap.read()
+            if ok:
+                frame = f
+        if frame is None:
+            raise RuntimeError("Camera không trả về hình")
+        return frame
+    finally:
+        cap.release()
+
+
+def grab_frame():
+    global frame_size
+    if running():
+        raise RuntimeError("Code của bạn đang giữ camera")
+    with cam_lock:  # hai lần bấm Chụp lại cùng lúc thì xếp hàng, không tranh camera
+        frame = read_frame()
+    h, w = frame.shape[:2]
+    frame_size = (w, h)
+    return cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
+
+
+# ---------- Web ----------
+@app.get("/")
+def index():
+    if not valid(request.args.get("t")):
+        return Response("Liên kết đã hết hạn. Gõ run trong Telegram để lấy liên kết mới.",
+                        401, mimetype="text/plain; charset=utf-8")
+    return send_file(BASE / "index.html", max_age=0)
+
+
+@app.get("/frame.jpg")
+def frame():
+    if not valid(request.args.get("t")):
+        return Response("hết hạn", 401)
+    try:
+        return Response(grab_frame(), mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        log("camera lỗi:", e)
+        return Response(str(e), 503)
+
+
+@app.post("/api/roi")
+def save_roi():
+    if not valid(request.args.get("t")):
+        return jsonify(error="Liên kết đã hết hạn, gõ run để lấy liên kết mới"), 401
+    pts = (request.get_json(silent=True) or {}).get("points")
+    try:
+        norm = [[min(1.0, max(0.0, float(x))), min(1.0, max(0.0, float(y)))] for x, y in pts]
+    except (TypeError, ValueError):
+        return jsonify(error="Dữ liệu điểm không hợp lệ"), 400
+    if len(norm) < 3:
+        return jsonify(error="Cần ít nhất 3 điểm"), 400
+    w, h = frame_size or (640, 480)
+    data = {
+        "width": w, "height": h,
+        "polygon": [[round(x * w), round(y * h)] for x, y in norm],
+        "polygon_norm": [[round(x, 5), round(y, 5)] for x, y in norm],
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with lock:
+        tmp = ROI_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:  # ghi xong mới thay file, tránh hỏng khi cúp điện giữa chừng
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ROI_FILE)
+        session.update(token=None, expires=0.0)
+        start_detector()
+    broadcast("Đã lưu vùng ROI, hệ thống đang chạy.")
+    return jsonify(ok=True)
+
+
+# ---------- Lệnh Telegram ----------
+def handle(chat, text):
+    if chat not in ALLOWED:
+        return say(chat, f"Chat ID của bạn là {chat}. Thêm số này vào ALLOWED_CHAT_IDS để điều khiển Pi.")
+    cmd = text.strip().lower().lstrip("/").split("@")[0]
+    if cmd == "run":
+        if ROI_FILE.exists():
+            start_detector()
+            say(chat, "Đã có vùng ROI nên chạy luôn. Gõ restart nếu muốn chọn lại vùng.")
+        else:
+            say(chat, "Mở liên kết để vẽ vùng ROI (hết hạn sau 15 phút):\n" + link())
+    elif cmd == "stop":
+        reset()
+        say(chat, "Đã dừng hẳn và xóa vùng ROI.")
+    elif cmd == "restart":
+        reset()
+        say(chat, "Đã xóa vùng cũ. Mở liên kết để chọn lại (hết hạn sau 15 phút):\n" + link())
+    else:
+        say(chat, HELP)
+
+
+def bot_loop():
+    offset = None
+    while True:
+        try:
+            r = tg("getUpdates", timeout=30, offset=offset, allowed_updates=["message"])
+            if not r.get("ok"):
+                log("Telegram từ chối:", r)
+                time.sleep(5)
+                continue
+            for u in r["result"]:
+                offset = u["update_id"] + 1
+                m = u.get("message") or {}
+                if m.get("text"):
+                    handle(m["chat"]["id"], m["text"])
+        except Exception as e:
+            log("bot lỗi:", e)
+            time.sleep(5)
+
+
+def shutdown(*_):
+    kill_detector()  # chỉ tắt tiến trình, giữ nguyên roi.json để lần bật sau chạy tiếp
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    resume_on_boot()
+    threading.Thread(target=watchdog, daemon=True).start()
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, threaded=True), daemon=True).start()
+    log("sẵn sàng, chờ lệnh Telegram")
+    bot_loop()
