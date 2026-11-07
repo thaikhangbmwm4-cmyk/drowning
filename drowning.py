@@ -1,3 +1,6 @@
+import json
+import signal
+import sys
 import threading
 import requests
 import cv2
@@ -8,6 +11,8 @@ from ultralytics import YOLO
 from collections import deque
 import os
 
+SHOW = False      # True nếu cắm màn hình, False khi chạy từ bot (không có cửa sổ)
+running = True
 os.makedirs("alerts", exist_ok=True)
 video_buffer = deque()
 BUFFER_SECONDS = 20
@@ -18,10 +23,13 @@ MAX_MATCH_DISTANCE = 60
 last = time.time()
 next_id = 1
 frame_count = 0
-points = []
 people = {}
 recently_lost = deque(maxlen=20)
 
+def stop_handler(*args):      # bot gửi 'stop' -> vòng lặp tự thoát
+    global running
+    running = False
+signal.signal(signal.SIGTERM, stop_handler)
 
 def send_photo_async(file_path, caption="ALERT"):
     def task():
@@ -36,7 +44,6 @@ def send_photo_async(file_path, caption="ALERT"):
 
     threading.Thread(target=task, daemon=True).start()
 
-
 def send_video_async(file_path, caption="ALERT"):
     def task():
         try:
@@ -50,14 +57,12 @@ def send_video_async(file_path, caption="ALERT"):
 
     threading.Thread(target=task, daemon=True).start()
 
-
 def get_event_video(buffer, event_time, pre=5, post=5):
     frames = []
     for t, f in buffer:
         if event_time - pre <= t <= event_time + post:
             frames.append(f)
     return frames
-
 
 def save_alert_video(frames):
     if len(frames) == 0:
@@ -70,25 +75,8 @@ def save_alert_video(frames):
     writer.release()
     return filename
 
-
 def in_water(pt):
     return cv2.pointPolygonTest(water_zone, pt, False) >= 0
-
-
-# def roi_distance(pt):
-#    return abs(
-#        cv2.pointPolygonTest(
-#            water_zone,
-#            pt,
-#            True
-#        )
-#    )
-
-# def near_roi_relative(pt, box):
-#    d = roi_distance(pt)
-#    x1, y1, x2, y2 = box
-#    h = max(1, y2 - y1)
-#    return d / h < 0.7
 
 def movement_score(history, box):
     if len(history) < 5:
@@ -105,7 +93,6 @@ def movement_score(history, box):
     x1, y1, x2, y2 = box
     box_h = max(1, y2 - y1)
     return total / box_h
-
 
 def moving_toward_edge(history, roi, box, near_ratio=1.5, min_move_ratio=0.08):
     if len(history) < 5:
@@ -146,18 +133,10 @@ def moving_toward_edge(history, roi, box, near_ratio=1.5, min_move_ratio=0.08):
         return False
     return new_dist < old_dist
 
-
-def mouse_click(event, x, y, flags, param):
-    global points
-    if event == cv2.EVENT_LBUTTONDOWN:
-        points.append((x, y))
-
-
 def distance(p1, p2):
     dx = p1[0] - p2[0]
     dy = p1[1] - p2[1]
     return (dx * dx + dy * dy) ** 0.5
-
 
 def box_iou(a, b):
     ax1, ay1, ax2, ay2 = a
@@ -173,7 +152,6 @@ def box_iou(a, b):
     area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0
-
 
 # =========================
 #  LIGHT MODEL (IMPORTANT)
@@ -191,42 +169,26 @@ picam2.start()
 #          ROI
 # =========================
 
-cv2.namedWindow("Select Water Zone")
-cv2.setMouseCallback("Select Water Zone", mouse_click)
-while True:
-    frame = picam2.capture_array()
-    if frame is None:
-        print("Camera fail frame")
-        continue
-    temp = frame.copy()
-    for p in points:
-        cv2.circle(temp, p, 3, (0, 0, 255), -1)
-    if len(points) >= 2:
-        cv2.polylines(temp, [np.array(points, np.int32)], False, (0, 255, 0), 1)
-    cv2.imshow("Select Water Zone", temp)
-    if cv2.waitKey(1) == ord('q') and len(points) >= 3:
-        temp = frame.copy()
-        cv2.polylines(
-            temp,
-            [np.array(points, np.int32)],
-            True,
-            (0, 255, 0),
-            2
-        )
-        cv2.imshow("Select Water Zone", temp)
-        cv2.waitKey(1000)
-        break
-if len(points) < 3:
-    print("Chưa chọn vùng nước")
-    exit()
-water_zone = np.array(points, np.int32)
-cv2.destroyWindow("Select Water Zone")
+if not os.path.exists("roi.json"):
+    print("Chưa có roi.json")
+    picam2.stop()
+    sys.exit(1)
+
+with open("roi.json") as f:
+    roi = json.load(f)
+
+sx = 640 / roi["width"]      # quy đổi nếu kích thước ảnh khác nhau
+sy = 480 / roi["height"]
+water_zone = np.array(
+    [[int(x * sx), int(y * sy)] for x, y in roi["points"]],
+    np.int32
+)
 
 # =========================
 # MAIN LOOP (OPTIMIZED FPS)
 # =========================
 
-while True:
+while running:
     frame_count += 1
     if frame_count % 2 != 0:
         continue
@@ -519,3 +481,13 @@ while True:
         break
 picam2.stop()
 cv2.destroyAllWindows()
+"""
+    if SHOW:
+        cv2.imshow("Raspberry Pi Drowning AI", frame)
+        if cv2.waitKey(1) == 27:
+            break
+
+picam2.stop()
+picam2.close()
+cv2.destroyAllWindows()
+"""
