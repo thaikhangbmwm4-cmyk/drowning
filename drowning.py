@@ -10,6 +10,12 @@ import time
 from ultralytics import YOLO
 from collections import deque
 import os
+from analysis.temporal_collector import (
+    create_temporal_state,
+    record_observation,
+    update_tracking_state,
+    DetectionIntervalTracker,
+)
 
 SHOW = False      # True nếu cắm màn hình, False khi chạy từ bot (không có cửa sổ)
 running = True
@@ -20,10 +26,11 @@ TOKEN = "8902284441:AAFGeIWRcXY9bvzdRZOwwJYFn_UBgN2G0js"
 CHAT_ID = -5474359022
 MOVE_THRESHOLD = 1
 MAX_MATCH_DISTANCE = 60
-last = time.time()
+last = time.monotonic()
 next_id = 1
 frame_count = 0
 people = {}
+detection_clock = DetectionIntervalTracker()
 recently_lost = deque(maxlen=20)
 
 def stop_handler(*args):      # bot gửi 'stop' -> vòng lặp tự thoát
@@ -192,7 +199,7 @@ while running:
     frame_count += 1
     if frame_count % 2 != 0:
         continue
-    now = time.time()
+    now = frame_time,
     dt = now - last
     last = now
     fps = 1 / dt if dt > 0 else 0
@@ -204,10 +211,16 @@ while running:
     if frame is None:
         print("Camera fail frame")
         continue
-    video_buffer.append((time.time(), frame.copy()))
+    frame_time = time.monotonic()   # mốc thời gian dùng chung cho cả frame
+    wall_time = time.time()         # giờ thật, chỉ để ghi log
+    detection_clock.update(frame_time)
+    missing_threshold = detection_clock.get_missing_threshold()
+    if frame_count % 100 == 0:
+        print(f"missing_threshold: {missing_threshold:.2f}s")
+    video_buffer.append((frame_time,), frame.copy()))
     while (
             len(video_buffer) > 0
-            and time.time() - video_buffer[0][0] > BUFFER_SECONDS
+            and frame_time, - video_buffer[0][0] > BUFFER_SECONDS
     ):
         video_buffer.popleft()
 
@@ -325,18 +338,19 @@ while running:
                         break
             else:
                 people[pid] = {
-                    "last_seen": time.time(),
+                    "last_seen": frame_time,
                     "last_pos": None,
                     "track_history": deque(maxlen=20),
-                    "last_water_time": 0,
+                    "last_water_time": None,
                     "video_sent": False,
                     "lost_start_time": None,
                     "in_water": False,
                     "lost_recorded": False,
-                    "last_box": None
+                    "last_box": None,
+                    **create_temporal_state()
                 }
         p = people[pid]
-        p["last_seen"] = time.time()
+        p["last_seen"] = frame_time
         p["lost_recorded"] = False
 
         # =======================
@@ -345,11 +359,19 @@ while running:
 
         inside = in_water(center)
         if inside:
-            p["last_water_time"] = time.time()
+            p["last_water_time"] = frame_time
         p["last_pos"] = center
         p["last_box"] = (x1, y1, x2, y2)
         p["track_history"].append(center)
-
+        record_observation(
+            person=p,
+            now=frame_time,
+            wall_time=wall_time,
+            center=center,
+            box=(x1, y1, x2, y2),
+            confidence=det["conf"],
+            inside_roi=inside,
+        )
         # =======================
         #   DRAW DETECTION
         # =======================
@@ -378,11 +400,19 @@ while running:
         #   PERSON ANALYSIS
         # =======================
 
-        lost_time = now - p["last_seen"]
+        lost_time = update_tracking_state(p, frame_time, missing_threshold)
+        if lost_time is None:
+            continue
+        if p["tracking_state"] == "missing" and frame_count % 20 == 0:
+            print(f"ID {pid} MISSING {lost_time:.1f}s | "
+                  f"lost_pos={p['lost_pos']} | trong_ROI={p['lost_inside_roi']}")
         x, y = p["last_pos"]
         moving_edge = moving_toward_edge(p["track_history"], water_zone, p["last_box"])
         move_score = movement_score(p["track_history"], p["last_box"])
-        recent_in_water = (now - p["last_water_time"] < 15)
+        recent_in_water = (
+            p["last_water_time"] is not None
+            and now - p["last_water_time"] < 15
+        )
 
         # =======================
         #   LOST DETECTION
