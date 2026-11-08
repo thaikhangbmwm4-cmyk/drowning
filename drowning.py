@@ -226,7 +226,7 @@ while running:
     missing_threshold = detection_clock.get_missing_threshold()
     video_buffer.append((frame_time, frame.copy()))
     while (
-            len(video_buffer) > 0
+            video_buffer
             and frame_time, - video_buffer[0][0] > BUFFER_SECONDS
     ):
         video_buffer.popleft()
