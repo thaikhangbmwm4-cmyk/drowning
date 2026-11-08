@@ -197,27 +197,34 @@ water_zone = np.array(
 
 while running:
     frame_count += 1
+
     if frame_count % 2 != 0:
         continue
-    now = frame_time,
-    dt = now - last
-    last = now
-    fps = 1 / dt if dt > 0 else 0
+
     detections = []
     filtered = []
-    if frame_count % 100 == 0:
-        print(f"FPS: {fps:.2f}")
+
     frame = picam2.capture_array()
+
     if frame is None:
         print("Camera fail frame")
         continue
-    frame_time = time.monotonic()   # mốc thời gian dùng chung cho cả frame
-    wall_time = time.time()         # giờ thật, chỉ để ghi log
+
+    # Lấy thời gian sau khi có frame hợp lệ
+    frame_time = time.monotonic()
+    wall_time = time.time()
+    now = frame_time
+
+    dt = frame_time - last
+    last = frame_time
+    fps = 1 / dt if dt > 0 else 0
+
+    if frame_count % 100 == 0:
+        print(f"FPS: {fps:.2f}")
+
     detection_clock.update(frame_time)
     missing_threshold = detection_clock.get_missing_threshold()
-    if frame_count % 100 == 0:
-        print(f"missing_threshold: {missing_threshold:.2f}s")
-    video_buffer.append((frame_time,), frame.copy()))
+    video_buffer.append((frame_time, frame.copy()))
     while (
             len(video_buffer) > 0
             and frame_time, - video_buffer[0][0] > BUFFER_SECONDS
