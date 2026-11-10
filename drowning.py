@@ -227,7 +227,7 @@ while running:
     video_buffer.append((frame_time, frame.copy()))
     while (
             video_buffer
-            and frame_time, - video_buffer[0][0] > BUFFER_SECONDS
+            and frame_time - video_buffer[0][0] > BUFFER_SECONDS
     ):
         video_buffer.popleft()
 
